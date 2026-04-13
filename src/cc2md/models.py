@@ -65,4 +65,6 @@ class Session:
     messages: list[Message] = field(default_factory=list)
     subconversations: dict[str, SubConversation] = field(default_factory=dict)
     # key: tool_use_id of the ToolUseBlock that spawned the subconversation
+    unlinked_subconversations: list[SubConversation] = field(default_factory=list)
+    # subagent JSONLs found in the subagents/ dir but not matched to any tool_use
     display_project: str | None = None  # human-readable project name

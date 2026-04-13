@@ -5,9 +5,11 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from .formats.base import RenderResult
+from .formats.markdown import MarkdownFormat
+from .models import Session
 from .sources.base import SessionMeta
 from .sources.claude_code import ClaudeCodeSource
-from .formats.markdown import MarkdownFormat
 
 
 def _print_table(sessions: list[SessionMeta]) -> None:
@@ -33,10 +35,45 @@ def _print_table(sessions: list[SessionMeta]) -> None:
         print(f"{i:<4} {ts:<20} {sid:<12} {title:<50} {proj}")
 
 
+def _session_stem(meta: SessionMeta) -> str:
+    """Derive a filesystem-safe stem from session metadata."""
+    ts = ""
+    if meta.timestamp:
+        try:
+            dt = datetime.fromisoformat(meta.timestamp.replace("Z", "+00:00"))
+            ts = dt.strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    safe_title = (meta.title or "untitled").replace(" ", "-").replace("/", "-")[:50]
+    return f"{ts}-{safe_title}" if ts else f"{meta.session_id[:8]}-{safe_title}"
+
+
+def _write_result(result: RenderResult, output: str | None, stem: str, fmt: MarkdownFormat) -> None:
+    """Write a RenderResult to disk (single file or directory)."""
+    if result.is_single_file:
+        path = Path(output) if output else Path(f"{stem}.{fmt.file_extension}")
+        path.write_text(result.single_content())
+        print(f"Wrote {path}", file=sys.stderr)
+    else:
+        # Multi-file: write to a directory
+        out_dir = Path(output) if output else Path(stem)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for rel_path, content in result.files.items():
+            dest = out_dir / rel_path
+            dest.write_text(content)
+        print(f"Wrote {out_dir}/  ({len(result.files)} files)", file=sys.stderr)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Convert Claude Code chat sessions to Markdown",
-        epilog="Examples:\n  cc2md --list\n  cc2md --latest -o chat.md\n  cc2md --all -d ./exports/\n  cc2md /path/to/session.jsonl",
+        epilog=(
+            "Examples:\n"
+            "  cc2md --list\n"
+            "  cc2md --latest -o chat.md\n"
+            "  cc2md --all -d ./exports/\n"
+            "  cc2md /path/to/session.jsonl"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -57,7 +94,10 @@ def main() -> None:
             "otherwise → projects dir (subdirs are project dirs)."
         ),
     )
-    parser.add_argument("--output", "-o", help="Output file path (default: stdout)")
+    parser.add_argument(
+        "--output", "-o",
+        help="Output path. Single file for sessions without subagents; directory for sessions with subagents.",
+    )
     parser.add_argument("--output-dir", "-d", help="Output directory (for --all mode)")
     parser.add_argument("--no-subagents", action="store_true", help="Exclude subagent conversations")
     parser.add_argument("--no-tool-results", action="store_true", help="Exclude tool call results")
@@ -73,15 +113,15 @@ def main() -> None:
         include_tool_results=not args.no_tool_results,
     )
 
-    # Direct file path — skip discovery entirely
+    # Direct file path — skip discovery
     if args.session and Path(args.session).is_file():
         session = source.load_file(Path(args.session))
-        md = fmt.render(session)
-        if args.output:
-            Path(args.output).write_text(md)
-            print(f"Wrote {args.output}", file=sys.stderr)
+        result = fmt.render(session)
+        if result.is_single_file and not args.output:
+            print(result.single_content())
         else:
-            print(md)
+            stem = session.session_id[:8]
+            _write_result(result, args.output, stem, fmt)
         return
 
     sessions = source.discover()
@@ -100,20 +140,18 @@ def main() -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
         for meta in sessions:
             session = source.load(meta)
-            md = fmt.render(session)
-            ts = ""
-            if meta.timestamp:
-                try:
-                    dt = datetime.fromisoformat(meta.timestamp.replace("Z", "+00:00"))
-                    ts = dt.strftime("%Y-%m-%d")
-                except ValueError:
-                    pass
-            safe_title = (meta.title or "untitled").replace(" ", "-").replace("/", "-")[:50]
-            ext = fmt.file_extension
-            filename = f"{ts}-{safe_title}.{ext}" if ts else f"{meta.session_id[:8]}-{safe_title}.{ext}"
-            out_path = out_dir / filename
-            out_path.write_text(md)
-            print(f"Wrote {out_path}", file=sys.stderr)
+            result = fmt.render(session)
+            stem = _session_stem(meta)
+            if result.is_single_file:
+                dest = out_dir / f"{stem}.{fmt.file_extension}"
+                dest.write_text(result.single_content())
+                print(f"Wrote {dest}", file=sys.stderr)
+            else:
+                session_dir = out_dir / stem
+                session_dir.mkdir(parents=True, exist_ok=True)
+                for rel_path, content in result.files.items():
+                    (session_dir / rel_path).write_text(content)
+                print(f"Wrote {session_dir}/  ({len(result.files)} files)", file=sys.stderr)
         return
 
     if args.latest:
@@ -129,13 +167,12 @@ def main() -> None:
             sys.exit(1)
 
     session = source.load(meta)
-    md = fmt.render(session)
+    result = fmt.render(session)
 
-    if args.output:
-        Path(args.output).write_text(md)
-        print(f"Wrote {args.output}", file=sys.stderr)
+    if result.is_single_file and not args.output:
+        print(result.single_content())
     else:
-        print(md)
+        _write_result(result, args.output, _session_stem(meta), fmt)
 
 
 if __name__ == "__main__":

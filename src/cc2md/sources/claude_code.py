@@ -122,17 +122,31 @@ def _read_jsonl(path: Path) -> list[dict]:
 def _build_subconversations(
     records: list[dict],
     subagent_dir: Path | None,
-) -> dict[str, SubConversation]:
-    """Build tool_use_id → SubConversation from progress records + sidechain JSONLs.
+) -> tuple[dict[str, SubConversation], list[SubConversation]]:
+    """Build subconversation mappings from sidechain JSONLs.
 
-    Progress records embed ``parentToolUseID`` (the id of the Task/Agent
-    tool_use that spawned the subagent) and ``data.agentId``.  The subagent's
-    own JSONL lives at ``subagent_dir/agent-{agentId}.jsonl``.
+    Returns ``(linked, unlinked)`` where:
+    - ``linked``: tool_use_id → SubConversation (agent linked to a Tool call)
+    - ``unlinked``: agents found in subagents/ dir but not matched to any tool_use
+
+    Three linkage strategies (all run unconditionally):
+
+    **Strategy 1** — progress records (new format):
+      ``progress`` records carry ``parentToolUseID`` and ``data.agentId``.
+
+    **Strategy 2** — toolUseResult.agentId in user records (old format):
+      User records carry ``toolUseResult.agentId`` and a ``tool_result`` block
+      with the matching ``tool_use_id``.
+
+    **Strategy 3** — directory scan fallback:
+      All ``agent-*.jsonl`` files in subagents/ that weren't linked by strategy
+      1 or 2, and whose name doesn't start with ``aprompt_suggestion-``, are
+      collected as unlinked subconversations.
     """
-    if not subagent_dir:
-        return {}
+    if not subagent_dir or not subagent_dir.is_dir():
+        return {}, []
 
-    # parentToolUseID → agentId (first occurrence wins)
+    # --- Strategy 1: progress records (new format) --------------------------
     tool_use_to_agent: dict[str, str] = {}
     for record in records:
         if record.get("type") == "progress":
@@ -141,7 +155,24 @@ def _build_subconversations(
             if parent_id and agent_id and parent_id not in tool_use_to_agent:
                 tool_use_to_agent[parent_id] = agent_id
 
-    # tool_use_id → (description, agent_type)
+    # --- Strategy 2: toolUseResult.agentId in user records (old format) -----
+    for record in records:
+        if record.get("type") != "user":
+            continue
+        tur = record.get("toolUseResult")
+        agent_id = tur.get("agentId") if isinstance(tur, dict) else None
+        if not agent_id:
+            continue
+        content = record.get("message", {}).get("content", [])
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                tool_use_id = block.get("tool_use_id", "")
+                if tool_use_id and tool_use_id not in tool_use_to_agent:
+                    tool_use_to_agent[tool_use_id] = agent_id
+
+    # --- Description / type: assistant tool_use block OR .meta.json ---------
     tool_use_meta: dict[str, tuple[str, str]] = {}
     for record in records:
         if record.get("type") == "assistant":
@@ -157,18 +188,15 @@ def _build_subconversations(
                         inp.get("subagent_type", "general-purpose"),
                     )
 
-    result: dict[str, SubConversation] = {}
-    for tool_use_id, agent_id in tool_use_to_agent.items():
+    # --- Helper: load a SubConversation from a JSONL path -------------------
+    def _load_sub(agent_id: str, tool_use_id: str, desc: str, atype: str) -> SubConversation:
         jsonl_path = subagent_dir / f"agent-{agent_id}.jsonl"
-        if not jsonl_path.exists():
-            continue
-        desc, atype = tool_use_meta.get(tool_use_id, ("", ""))
-        messages = [
+        messages = _merge_assistant_turns([
             _record_to_message(r)
             for r in _read_jsonl(jsonl_path)
             if r.get("type") in ("user", "assistant")
-        ]
-        result[tool_use_id] = SubConversation(
+        ])
+        return SubConversation(
             agent_id=agent_id,
             tool_use_id=tool_use_id,
             description=desc,
@@ -176,7 +204,65 @@ def _build_subconversations(
             messages=messages,
         )
 
-    return result
+    def _get_meta(tool_use_id: str, agent_id: str) -> tuple[str, str]:
+        if tool_use_id in tool_use_meta:
+            return tool_use_meta[tool_use_id]
+        meta_path = subagent_dir / f"agent-{agent_id}.meta.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+                return meta.get("description", ""), meta.get("agentType", "general-purpose")
+            except (json.JSONDecodeError, OSError):
+                pass
+        return "", "general-purpose"
+
+    # --- Assemble linked SubConversation objects ----------------------------
+    linked: dict[str, SubConversation] = {}
+    for tool_use_id, agent_id in tool_use_to_agent.items():
+        jsonl_path = subagent_dir / f"agent-{agent_id}.jsonl"
+        if not jsonl_path.exists():
+            continue
+        desc, atype = _get_meta(tool_use_id, agent_id)
+        linked[tool_use_id] = _load_sub(agent_id, tool_use_id, desc, atype)
+
+    # --- Strategy 3: scan dir for unlinked agents ---------------------------
+    linked_agent_ids = {sub.agent_id for sub in linked.values()}
+    unlinked: list[SubConversation] = []
+    for jsonl_path in sorted(subagent_dir.glob("agent-*.jsonl")):
+        agent_id = jsonl_path.stem[len("agent-"):]
+        # Skip internal Claude Code suggestion agents
+        if agent_id.startswith("aprompt_suggestion-"):
+            continue
+        if agent_id in linked_agent_ids:
+            continue
+        meta_path = subagent_dir / f"agent-{agent_id}.meta.json"
+        desc, atype = "", "general-purpose"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+                desc = meta.get("description", "")
+                atype = meta.get("agentType", "general-purpose")
+            except (json.JSONDecodeError, OSError):
+                pass
+        unlinked.append(_load_sub(agent_id, "", desc, atype))
+
+    return linked, unlinked
+
+
+def _merge_assistant_turns(messages: list[Message]) -> list[Message]:
+    """Merge consecutive assistant messages into one.
+
+    Claude Code can emit several ``assistant`` records for the same turn
+    (e.g. a text block followed by a tool_use block). Merging them produces
+    a cleaner rendering where text and tool calls appear together.
+    """
+    merged: list[Message] = []
+    for msg in messages:
+        if msg.role == "assistant" and merged and merged[-1].role == "assistant":
+            merged[-1].blocks.extend(msg.blocks)
+        else:
+            merged.append(msg)
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +413,7 @@ class ClaudeCodeSource(BaseSource):
             for r in records
             if r.get("type") in ("user", "assistant")
         ]
-        subconversations = _build_subconversations(records, subagent_dir)
+        linked, unlinked = _build_subconversations(records, subagent_dir)
         return Session(
             session_id=session_id,
             project=project,
@@ -335,5 +421,6 @@ class ClaudeCodeSource(BaseSource):
             title=title,
             timestamp=timestamp,
             messages=messages,
-            subconversations=subconversations,
+            subconversations=linked,
+            unlinked_subconversations=unlinked,
         )

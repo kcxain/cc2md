@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -13,13 +14,27 @@ from ..models import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from .base import BaseFormat
+from .base import BaseFormat, RenderResult
 
 _AGENT_TOOL_NAMES = {"Agent", "Task"}
 
 
+def _safe_filename(text: str, max_len: int = 40) -> str:
+    """Convert arbitrary text to a safe filename stem."""
+    text = re.sub(r"[^\w\s-]", "", text).strip().lower()
+    text = re.sub(r"[\s_]+", "-", text)
+    return text[:max_len].rstrip("-")
+
+
 class MarkdownFormat(BaseFormat):
-    """Renders a Session as GitHub-flavoured Markdown."""
+    """Renders a Session as GitHub-flavoured Markdown.
+
+    Sessions with subagents produce a **directory**:
+      index.md                  — main conversation with links to subagent files
+      {desc}-{agent_id}.md      — one file per subagent
+
+    Sessions without subagents produce a single file.
+    """
 
     def __init__(
         self,
@@ -37,11 +52,57 @@ class MarkdownFormat(BaseFormat):
     # Public entry point
     # ------------------------------------------------------------------
 
-    def render(self, session: Session) -> str:
+    def render(self, session: Session) -> RenderResult:
+        has_subs = self.include_subagents and bool(
+            session.subconversations or session.unlinked_subconversations
+        )
+        if has_subs:
+            return self._render_multi(session)
         lines = self._render_header(session)
         for msg in session.messages:
-            self._append_message(msg, session, lines)
-        return "\n".join(lines)
+            self._append_message(msg, session, lines, subagent_links=None)
+        return RenderResult(files={f"index.{self.file_extension}": "\n".join(lines)})
+
+    # ------------------------------------------------------------------
+    # Multi-file rendering
+    # ------------------------------------------------------------------
+
+    def _render_multi(self, session: Session) -> RenderResult:
+        # Build tool_use_id → subagent filename map (linked)
+        subagent_links: dict[str, str] = {}
+        for tool_use_id, sub in session.subconversations.items():
+            name = _safe_filename(sub.description or sub.agent_id)
+            filename = f"{name}-{sub.agent_id[:7]}.{self.file_extension}"
+            subagent_links[tool_use_id] = filename
+
+        # Main file
+        lines = self._render_header(session)
+        for msg in session.messages:
+            self._append_message(msg, session, lines, subagent_links=subagent_links)
+
+        files: dict[str, str] = {}
+
+        # One file per linked subagent
+        for tool_use_id, filename in subagent_links.items():
+            sub = session.subconversations[tool_use_id]
+            files[filename] = self._render_subconversation_page(sub)
+
+        # One file per unlinked subagent (with links appended to main file)
+        unlinked_links: list[str] = []
+        for sub in session.unlinked_subconversations:
+            name = _safe_filename(sub.description or sub.agent_id)
+            filename = f"{name}-{sub.agent_id[:7]}.{self.file_extension}"
+            desc = sub.description or sub.agent_id
+            unlinked_links.append(f"[→ Subagent: {desc}]({filename})\n")
+            files[filename] = self._render_subconversation_page(sub)
+
+        if unlinked_links:
+            lines.append("---\n")
+            lines.append("## Other Subagent Conversations\n")
+            lines.extend(unlinked_links)
+
+        files[f"index.{self.file_extension}"] = "\n".join(lines)
+        return RenderResult(files=files)
 
     # ------------------------------------------------------------------
     # Header
@@ -73,7 +134,13 @@ class MarkdownFormat(BaseFormat):
     # Messages
     # ------------------------------------------------------------------
 
-    def _append_message(self, msg: Message, session: Session, lines: list[str]) -> None:
+    def _append_message(
+        self,
+        msg: Message,
+        session: Session,
+        lines: list[str],
+        subagent_links: dict[str, str] | None,
+    ) -> None:
         if msg.role == "user":
             if msg.is_tool_result_only:
                 if self.include_tool_results:
@@ -94,12 +161,21 @@ class MarkdownFormat(BaseFormat):
 
             if self.include_subagents:
                 for block in msg.blocks:
-                    if isinstance(block, ToolUseBlock) and block.name in _AGENT_TOOL_NAMES:
-                        sub = session.subconversations.get(block.id)
-                        if sub:
-                            lines.append("<details><summary>Subagent Conversation</summary>\n")
-                            lines.append(self._render_subconversation(sub))
-                            lines.append("</details>\n")
+                    if not (isinstance(block, ToolUseBlock) and block.name in _AGENT_TOOL_NAMES):
+                        continue
+                    sub = session.subconversations.get(block.id)
+                    if not sub:
+                        continue
+                    if subagent_links:
+                        # Multi-file mode: insert a link
+                        filename = subagent_links[block.id]
+                        desc = sub.description or "Subagent"
+                        lines.append(f"[→ Subagent: {desc}]({filename})\n")
+                    else:
+                        # Single-file mode: inline <details>
+                        lines.append("<details><summary>Subagent Conversation</summary>\n")
+                        lines.append(self._render_subconversation_inline(sub))
+                        lines.append("</details>\n")
 
     # ------------------------------------------------------------------
     # Block rendering
@@ -206,12 +282,10 @@ class MarkdownFormat(BaseFormat):
         return f"{prefix}```\n{content}\n```"
 
     # ------------------------------------------------------------------
-    # Subconversations
+    # Subconversation rendering
     # ------------------------------------------------------------------
 
-    def _render_subconversation(self, sub: SubConversation) -> str:
-        desc = sub.description or "Subagent"
-        lines = [f"#### Subagent: {desc}", f"*Type: {sub.agent_type or 'unknown'}*\n"]
+    def _render_subconversation_messages(self, sub: SubConversation, lines: list[str]) -> None:
         for msg in sub.messages:
             if msg.is_tool_result_only:
                 if self.include_tool_results:
@@ -228,4 +302,25 @@ class MarkdownFormat(BaseFormat):
                 lines.append(f"**Prompt:**\n\n{rendered}\n")
             else:
                 lines.append(f"{rendered}\n")
+
+    def _render_subconversation_inline(self, sub: SubConversation) -> str:
+        """Compact rendering for single-file (inline) mode."""
+        desc = sub.description or "Subagent"
+        lines = [f"#### Subagent: {desc}", f"*Type: {sub.agent_type or 'unknown'}*\n"]
+        self._render_subconversation_messages(sub, lines)
+        return "\n".join(lines)
+
+    def _render_subconversation_page(self, sub: SubConversation) -> str:
+        """Standalone page rendering for multi-file mode."""
+        desc = sub.description or "Subagent"
+        lines = [
+            f"# Subagent: {desc}",
+            "",
+            f"**Type:** {sub.agent_type or 'unknown'}  ",
+            f"**Agent ID:** `{sub.agent_id}`  ",
+            "",
+            "---",
+            "",
+        ]
+        self._render_subconversation_messages(sub, lines)
         return "\n".join(lines)
