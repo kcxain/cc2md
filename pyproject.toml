@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cc2md"
-version = "0.1.0"
+version = "0.2.0"
 description = "Convert Claude Code chat sessions to Markdown"
 readme = "README.md"
 license = "MIT"
@@ -19,4 +19,7 @@ classifiers = [
 ]
 
 [project.scripts]
-cc2md = "cc2md:main"
+cc2md = "cc2md.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
