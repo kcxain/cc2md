@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 from typing import Union
 
 
@@ -68,3 +69,4 @@ class Session:
     unlinked_subconversations: list[SubConversation] = field(default_factory=list)
     # subagent JSONLs found in the subagents/ dir but not matched to any tool_use
     display_project: str | None = None  # human-readable project name
+    metadata: dict[str, Any] = field(default_factory=dict)
