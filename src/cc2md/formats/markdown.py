@@ -39,6 +39,60 @@ def _subagent_filename(description: str, agent_id: str, used: set[str], ext: str
     return filename
 
 
+def _truncate_lines(lines: list[str], keep: int = 60) -> list[str]:
+    if len(lines) <= keep:
+        return lines
+    head = keep // 2
+    tail = keep - head
+    omitted = len(lines) - keep
+    return lines[:head] + [f"... ({omitted} lines omitted) ..."] + lines[-tail:]
+
+
+def _prefixed_lines(text: str, prefix: str) -> list[str]:
+    return [f"{prefix}{line}" for line in text.split("\n")]
+
+
+def _render_diff_block(lines: list[str]) -> str:
+    truncated = _truncate_lines(lines)
+    return "```diff\n" + "\n".join(truncated) + "\n```"
+
+
+def _render_add_diff(content: str) -> str:
+    return _render_diff_block(_prefixed_lines(content, "+ "))
+
+
+def _render_delete_diff(content: str) -> str:
+    return _render_diff_block(_prefixed_lines(content, "- "))
+
+
+def _render_replace_diff(old: str, new: str) -> str:
+    return _render_diff_block(_prefixed_lines(old, "- ") + _prefixed_lines(new, "+ "))
+
+
+def _render_multi_edit_diff(edits: list[dict]) -> str:
+    lines: list[str] = []
+    for index, edit in enumerate(edits, 1):
+        old = str(edit.get("old_string", edit.get("oldText", "")))
+        new = str(edit.get("new_string", edit.get("newText", "")))
+        replace_all = edit.get("replace_all")
+        if index > 1:
+            lines.append("@@")
+        old_lines = _prefixed_lines(old, "- ")
+        new_lines = _prefixed_lines(new, "+ ")
+        if replace_all:
+            lines.append(f"# replace_all={replace_all}")
+        lines.extend(old_lines + new_lines)
+    return _render_diff_block(lines)
+
+
+def _extract_patch_text(inp: dict) -> str:
+    for key in ("patch", "input", "content", "diff"):
+        value = inp.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
 class MarkdownFormat(BaseFormat):
     """Renders a Session as GitHub-flavoured Markdown.
 
@@ -222,6 +276,7 @@ class MarkdownFormat(BaseFormat):
 
     def _render_tool_use(self, block: ToolUseBlock) -> str:
         name = block.name
+        lower_name = name.lower()
         inp = block.input
         lines = [f"**Tool: {name}**"]
 
@@ -234,35 +289,48 @@ class MarkdownFormat(BaseFormat):
         elif name == "Read":
             lines.append(f"Reading `{inp.get('file_path', '')}`")
 
-        elif name == "Write":
+        elif name in {"Write", "Add"} or lower_name in {"write", "add", "create_file"}:
             fp = inp.get("file_path", "")
             content = inp.get("content", "")
-            lines.append(f"Writing `{fp}`")
+            action = "Adding" if name == "Add" or lower_name in {"add", "create_file"} else "Writing"
+            lines.append(f"{action} `{fp}`")
             if content:
-                cl = content.split("\n")
-                if len(cl) > 30:
-                    preview = (
-                        "\n".join(cl[:15])
-                        + f"\n\n... ({len(cl) - 30} lines omitted) ...\n\n"
-                        + "\n".join(cl[-15:])
-                    )
-                else:
-                    preview = content
-                ext = Path(fp).suffix.lstrip(".")
-                lines.append(f"```{ext}\n{preview}\n```")
+                lines.append(_render_add_diff(content))
 
-        elif name == "Edit":
+        elif name == "Edit" or lower_name in {"edit", "replace_in_file"}:
             fp = inp.get("file_path", "")
             old = inp.get("old_string", "")
             new = inp.get("new_string", "")
             lines.append(f"Editing `{fp}`")
             if old or new:
-                lines.append("```diff")
-                for ln in old.split("\n"):
-                    lines.append(f"- {ln}")
-                for ln in new.split("\n"):
-                    lines.append(f"+ {ln}")
-                lines.append("```")
+                lines.append(_render_replace_diff(old, new))
+
+        elif name == "MultiEdit" or lower_name in {"multiedit", "multi_edit"}:
+            fp = inp.get("file_path", "")
+            edits = inp.get("edits", [])
+            lines.append(f"Editing `{fp}`")
+            if isinstance(edits, list) and edits:
+                normalized = [edit for edit in edits if isinstance(edit, dict)]
+                if normalized:
+                    lines.append(_render_multi_edit_diff(normalized))
+
+        elif lower_name in {"apply_patch", "applypatch"}:
+            patch = _extract_patch_text(inp)
+            lines.append("Applying patch")
+            if patch:
+                lines.append(_render_diff_block(patch.split("\n")))
+
+        elif name in {"Delete", "DeleteFile"} or lower_name in {"delete", "delete_file", "remove_file"}:
+            fp = inp.get("file_path", inp.get("path", ""))
+            content = str(
+                inp.get("old_string")
+                or inp.get("old_content")
+                or inp.get("content")
+                or ""
+            )
+            lines.append(f"Deleting `{fp}`")
+            if content:
+                lines.append(_render_delete_diff(content))
 
         elif name == "Grep":
             lines.append(f"Searching for `{inp.get('pattern', '')}` in `{inp.get('path', '.')}`")
