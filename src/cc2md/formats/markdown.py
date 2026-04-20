@@ -54,7 +54,7 @@ def _prefixed_lines(text: str, prefix: str) -> list[str]:
 
 def _render_diff_block(lines: list[str]) -> str:
     truncated = _truncate_lines(lines)
-    return "```diff\n" + "\n".join(truncated) + "\n```"
+    return _fenced_block("\n".join(truncated), "diff")
 
 
 def _render_add_diff(content: str) -> str:
@@ -86,11 +86,25 @@ def _render_multi_edit_diff(edits: list[dict]) -> str:
 
 
 def _extract_patch_text(inp: dict) -> str:
-    for key in ("patch", "input", "content", "diff"):
+    for key in ("patch", "input", "content", "diff", "raw"):
         value = inp.get(key)
         if isinstance(value, str) and value.strip():
             return value
     return ""
+
+
+def _fenced_block(content: str, info: str = "") -> str:
+    max_run = 0
+    current = 0
+    for char in content:
+        if char == "`":
+            current += 1
+            max_run = max(max_run, current)
+        else:
+            current = 0
+    fence = "`" * max(3, max_run + 1)
+    info_suffix = info if info else ""
+    return f"{fence}{info_suffix}\n{content}\n{fence}"
 
 
 def _format_metadata_value(value: object) -> str:
@@ -174,8 +188,7 @@ class MarkdownFormat(BaseFormat):
         if has_subs:
             return self._render_multi(session)
         lines = self._render_header(session)
-        for msg in session.messages:
-            self._append_message(msg, session, lines, subagent_links=None)
+        self._render_message_sequence(session.messages, session, lines, subagent_links=None)
         return RenderResult(files={f"index.{self.file_extension}": "\n".join(lines)})
 
     # ------------------------------------------------------------------
@@ -197,8 +210,7 @@ class MarkdownFormat(BaseFormat):
 
         # Main file
         lines = self._render_header(session)
-        for msg in session.messages:
-            self._append_message(msg, session, lines, subagent_links=subagent_links)
+        self._render_message_sequence(session.messages, session, lines, subagent_links=subagent_links)
 
         files: dict[str, str] = {}
 
@@ -259,66 +271,111 @@ class MarkdownFormat(BaseFormat):
     # Messages
     # ------------------------------------------------------------------
 
-    def _append_message(
+    def _render_message_sequence(
         self,
-        msg: Message,
+        messages: list[Message],
         session: Session,
         lines: list[str],
         subagent_links: dict[str, str] | None,
     ) -> None:
-        if msg.role == "user":
-            if msg.is_tool_result_only:
-                if self.include_tool_results:
-                    rendered = self._render_blocks(msg.blocks)
+        index = 0
+        while index < len(messages):
+            msg = messages[index]
+            if msg.role == "user":
+                if not msg.is_tool_result_only:
+                    rendered = self._render_plain_blocks(msg.blocks)
                     if rendered.strip():
-                        lines.append(
-                            f"<details><summary>Tool Result</summary>\n\n{rendered}\n\n</details>\n"
-                        )
-            else:
-                rendered = self._render_blocks(msg.blocks)
-                if rendered.strip():
-                    lines.append(f"## User\n\n{rendered}\n")
+                        lines.append(f"## User\n\n{rendered}\n")
+                index += 1
+                continue
 
-        elif msg.role == "assistant":
-            rendered = self._render_blocks(msg.blocks)
+            if msg.role != "assistant":
+                index += 1
+                continue
+
+            result_map, next_index = self._collect_tool_results(messages, index + 1)
+            rendered = self._render_assistant_message(msg, session, result_map, subagent_links)
             if rendered.strip():
                 lines.append(f"## Assistant\n\n{rendered}\n")
+            index = next_index
 
-            if self.include_subagents:
-                for block in msg.blocks:
-                    if not (isinstance(block, ToolUseBlock) and block.name in _AGENT_TOOL_NAMES):
-                        continue
-                    sub = session.subconversations.get(block.id)
-                    if not sub:
-                        continue
+    def _collect_tool_results(
+        self,
+        messages: list[Message],
+        start_index: int,
+    ) -> tuple[dict[str, list[ToolResultBlock]], int]:
+        result_map: dict[str, list[ToolResultBlock]] = {}
+        index = start_index
+        while index < len(messages) and messages[index].role == "user" and messages[index].is_tool_result_only:
+            for block in messages[index].blocks:
+                if isinstance(block, ToolResultBlock):
+                    result_map.setdefault(block.tool_use_id, []).append(block)
+            index += 1
+        return result_map, index
+
+    def _render_assistant_message(
+        self,
+        msg: Message,
+        session: Session,
+        result_map: dict[str, list[ToolResultBlock]],
+        subagent_links: dict[str, str] | None,
+    ) -> str:
+        parts: list[str] = []
+        for block in msg.blocks:
+            if isinstance(block, TextBlock):
+                if block.text:
+                    parts.append(block.text)
+                continue
+            if isinstance(block, ImageBlock):
+                parts.append("*[image]*")
+                continue
+            if not isinstance(block, ToolUseBlock):
+                continue
+
+            rendered_tool = self._render_tool_use(block)
+            if rendered_tool:
+                parts.append(rendered_tool)
+
+            if self.include_tool_results:
+                for result in result_map.get(block.id, []):
+                    rendered_result = self._render_tool_result_for_call(block, result)
+                    if rendered_result:
+                        parts.append(rendered_result)
+
+            if self.include_subagents and block.name in _AGENT_TOOL_NAMES:
+                sub = session.subconversations.get(block.id)
+                if sub:
                     if subagent_links:
-                        # Multi-file mode: insert a link
                         filename = subagent_links[block.id]
                         desc = sub.description or "Subagent"
-                        lines.append(f"[→ Subagent: {desc}]({filename})\n")
+                        parts.append(f"[→ Subagent: {desc}]({filename})")
                     else:
-                        # Single-file mode: inline <details>
-                        lines.append("<details><summary>Subagent Conversation</summary>\n")
-                        lines.append(self._render_subconversation_inline(sub))
-                        lines.append("</details>\n")
+                        parts.append(self._render_subconversation_inline(sub))
+
+        unmatched_results = [
+            result
+            for tool_use_id, results in result_map.items()
+            if not any(isinstance(block, ToolUseBlock) and block.id == tool_use_id for block in msg.blocks)
+            for result in results
+        ]
+        if self.include_tool_results:
+            for result in unmatched_results:
+                rendered_result = self._render_orphan_tool_result(result)
+                if rendered_result:
+                    parts.append(rendered_result)
+
+        return "\n\n".join(part for part in parts if part.strip())
 
     # ------------------------------------------------------------------
     # Block rendering
     # ------------------------------------------------------------------
 
-    def _render_blocks(self, blocks: list) -> str:
+    def _render_plain_blocks(self, blocks: list) -> str:
         parts: list[str] = []
         for block in blocks:
             if isinstance(block, TextBlock):
                 if block.text:
                     parts.append(block.text)
-            elif isinstance(block, ToolUseBlock):
-                parts.append(self._render_tool_use(block))
-            elif isinstance(block, ToolResultBlock):
-                if self.include_tool_results:
-                    r = self._render_tool_result(block)
-                    if r:
-                        parts.append(r)
             elif isinstance(block, ImageBlock):
                 parts.append("*[image]*")
         return "\n\n".join(parts)
@@ -333,7 +390,7 @@ class MarkdownFormat(BaseFormat):
             desc = inp.get("description", "")
             if desc:
                 lines.append(f"*{desc}*")
-            lines.append(f"```bash\n{inp.get('command', '')}\n```")
+            lines.append(_fenced_block(inp.get("command", ""), "bash"))
 
         elif name == "Read":
             lines.append(f"Reading `{inp.get('file_path', '')}`")
@@ -401,26 +458,26 @@ class MarkdownFormat(BaseFormat):
             desc = inp.get("justification", "")
             if desc:
                 lines.append(f"*{desc}*")
-            lines.append(f"```bash\n{inp.get('cmd', '')}\n```")
+            lines.append(_fenced_block(inp.get("cmd", ""), "bash"))
 
         elif name == "write_stdin":
             session_id = inp.get("session_id", "")
             chars = inp.get("chars", "")
             lines.append(f"Sending input to session `{session_id}`")
             if chars:
-                lines.append(f"```text\n{chars}\n```")
+                lines.append(_fenced_block(chars, "text"))
 
         elif name == "wait_agent":
             targets = inp.get("targets", [])
             lines.append("Waiting for subagents")
             if targets:
-                lines.append(f"```json\n{json.dumps(targets, ensure_ascii=False, indent=2)}\n```")
+                lines.append(_fenced_block(json.dumps(targets, ensure_ascii=False, indent=2), "json"))
 
         elif name == "send_input":
             target = inp.get("target", "")
             lines.append(f"Sending input to agent `{target}`")
             if inp.get("message"):
-                lines.append(f"```text\n{inp['message']}\n```")
+                lines.append(_fenced_block(inp["message"], "text"))
 
         elif name == "close_agent":
             lines.append(f"Closing agent `{inp.get('target', '')}`")
@@ -430,14 +487,16 @@ class MarkdownFormat(BaseFormat):
 
         else:
             if inp:
-                lines.append(f"```json\n{json.dumps(inp, indent=2)[:500]}\n```")
+                lines.append(_fenced_block(json.dumps(inp, ensure_ascii=False, indent=2)[:500], "json"))
 
         return "\n".join(lines)
 
-    def _render_tool_result(self, block: ToolResultBlock) -> str:
+    def _render_tool_result_for_call(self, tool: ToolUseBlock, block: ToolResultBlock) -> str:
         if not block.content:
             return ""
-        prefix = "**Error:**\n" if block.is_error else ""
+        prefix = f"**Result: {tool.name}**"
+        if block.is_error:
+            prefix += " `error`"
         content = block.content
         lines = content.split("\n")
         if len(lines) > 50:
@@ -446,34 +505,60 @@ class MarkdownFormat(BaseFormat):
                 + f"\n\n... ({len(lines) - 50} lines omitted) ...\n\n"
                 + "\n".join(lines[-25:])
             )
-        return f"{prefix}```\n{content}\n```"
+        return f"{prefix}\n{_fenced_block(content)}"
+
+    def _render_orphan_tool_result(self, block: ToolResultBlock) -> str:
+        if not block.content:
+            return ""
+        prefix = f"**Tool Result:** `{block.tool_use_id}`"
+        if block.is_error:
+            prefix += " `error`"
+        return f"{prefix}\n{_fenced_block(block.content)}"
 
     # ------------------------------------------------------------------
     # Subconversation rendering
     # ------------------------------------------------------------------
 
     def _render_subconversation_messages(self, sub: SubConversation, lines: list[str]) -> None:
-        for msg in sub.messages:
-            if msg.is_tool_result_only:
-                if self.include_tool_results:
-                    rendered = self._render_blocks(msg.blocks)
-                    if rendered.strip():
-                        lines.append(
-                            f"<details><summary>Tool Result</summary>\n\n{rendered}\n\n</details>\n"
-                        )
-                continue
-            rendered = self._render_blocks(msg.blocks)
-            if not rendered.strip():
-                continue
+        index = 0
+        while index < len(sub.messages):
+            msg = sub.messages[index]
             if msg.role == "user":
-                lines.append(f"**Prompt:**\n\n{rendered}\n")
-            else:
+                if not msg.is_tool_result_only:
+                    rendered = self._render_plain_blocks(msg.blocks)
+                    if rendered.strip():
+                        lines.append(f"**Prompt:**\n\n{rendered}\n")
+                index += 1
+                continue
+
+            if msg.role != "assistant":
+                index += 1
+                continue
+
+            result_map, next_index = self._collect_tool_results(sub.messages, index + 1)
+            rendered = self._render_assistant_message(
+                msg=msg,
+                session=Session(
+                    session_id="",
+                    project="",
+                    title=None,
+                    timestamp=None,
+                    metadata={},
+                ),
+                result_map=result_map,
+                subagent_links=None,
+            )
+            if rendered.strip():
                 lines.append(f"{rendered}\n")
+            index = next_index
 
     def _render_subconversation_inline(self, sub: SubConversation) -> str:
         """Compact rendering for single-file (inline) mode."""
         desc = sub.description or "Subagent"
         lines = [f"#### Subagent: {desc}", f"*Type: {sub.agent_type or 'unknown'}*\n"]
+        metadata_lines = _codex_metadata_lines(sub.metadata)
+        if metadata_lines:
+            lines.extend(metadata_lines)
         self._render_subconversation_messages(sub, lines)
         return "\n".join(lines)
 
