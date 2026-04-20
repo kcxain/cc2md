@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from ..models import Message
@@ -71,13 +72,42 @@ def _format_sandbox_policy(policy: object) -> str | None:
     return ", ".join(parts) if parts else None
 
 
+def _parse_iso_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _format_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec}s"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m {sec}s"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h {minutes}m {sec}s"
+
+
 def _collect_metadata(records: list[dict]) -> dict[str, object]:
     session_meta: dict | None = None
     turn_context: dict | None = None
     last_token_count: dict | None = None
+    first_timestamp: str | None = None
+    last_timestamp: str | None = None
 
     for record in records:
         record_type = record.get("type")
+        timestamp = record.get("timestamp")
+        if isinstance(timestamp, str):
+            if first_timestamp is None:
+                first_timestamp = timestamp
+            last_timestamp = timestamp
         if record_type == "session_meta" and session_meta is None:
             payload = record.get("payload")
             if isinstance(payload, dict):
@@ -94,6 +124,18 @@ def _collect_metadata(records: list[dict]) -> dict[str, object]:
                 last_token_count = payload
 
     metadata: dict[str, object] = {}
+    if first_timestamp:
+        metadata["first_event_at"] = first_timestamp
+    if last_timestamp:
+        metadata["last_event_at"] = last_timestamp
+    start_dt = _parse_iso_timestamp(session_meta.get("timestamp") if isinstance(session_meta, dict) else None)
+    if start_dt is None:
+        start_dt = _parse_iso_timestamp(first_timestamp)
+    end_dt = _parse_iso_timestamp(last_timestamp)
+    if start_dt is not None and end_dt is not None:
+        duration_seconds = max(0, int((end_dt - start_dt).total_seconds()))
+        metadata["duration_seconds"] = duration_seconds
+        metadata["duration"] = _format_duration(duration_seconds)
     if isinstance(session_meta, dict):
         for src_key, dest_key in (
             ("originator", "originator"),
@@ -333,13 +375,15 @@ def _load_subconversation(
     description: str,
     agent_type: str,
 ) -> SubConversation:
-    messages = _build_messages(_read_jsonl(rollout_path))
+    records = _read_jsonl(rollout_path)
+    messages = _build_messages(records)
     return SubConversation(
         agent_id=agent_id,
         tool_use_id=tool_use_id,
         description=description,
         agent_type=agent_type,
         messages=messages,
+        metadata=_collect_metadata(records),
     )
 
 
@@ -441,7 +485,10 @@ class CodexSource(BaseSource):
             if meta is not None:
                 sessions.append(meta)
 
-        sessions.sort(key=lambda session: session.timestamp or "", reverse=True)
+        sessions.sort(
+            key=lambda session: session.sort_timestamp or session.timestamp or "",
+            reverse=True,
+        )
         return sessions
 
     def _build_meta(self, rollout_path: Path, sessions_root: Path) -> SessionMeta | None:
@@ -460,6 +507,7 @@ class CodexSource(BaseSource):
             return None
 
         title: str | None = None
+        last_timestamp = timestamp
         try:
             with open(rollout_path) as f:
                 for line in f:
@@ -467,10 +515,10 @@ class CodexSource(BaseSource):
                         record = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    if record.get("timestamp"):
+                        last_timestamp = record["timestamp"]
                     if record.get("type") == "event_msg" and record.get("payload", {}).get("type") == "user_message":
                         title = _derive_title(record["payload"].get("message"))
-                        if title:
-                            break
         except OSError:
             pass
 
@@ -480,6 +528,7 @@ class CodexSource(BaseSource):
             project=cwd,
             title=title,
             timestamp=timestamp,
+            sort_timestamp=last_timestamp,
             display_project=cwd,
         )
 

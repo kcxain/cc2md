@@ -321,7 +321,7 @@ class ClaudeCodeSource(BaseSource):
                     continue
                 sessions.append(self._build_meta(jsonl_file, project_dir))
 
-        sessions.sort(key=lambda s: s.timestamp or "", reverse=True)
+        sessions.sort(key=lambda s: s.sort_timestamp or s.timestamp or "", reverse=True)
         return sessions
 
     def _build_meta(self, jsonl_file: Path, project_dir: Path) -> SessionMeta:
@@ -348,6 +348,7 @@ class ClaudeCodeSource(BaseSource):
             project=project_dir.name,
             title=title,
             timestamp=timestamp,
+            sort_timestamp=timestamp,
             display_project=_decode_project_path(project_dir.name),
         )
 
