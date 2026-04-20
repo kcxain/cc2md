@@ -218,6 +218,12 @@ def _parse_tool_input(raw: object) -> dict:
     return {"value": raw}
 
 
+def _parse_custom_tool_input(name: object, raw: object) -> dict:
+    if name == "apply_patch" and isinstance(raw, str):
+        return {"patch": raw}
+    return _parse_tool_input(raw)
+
+
 def _parse_assistant_text(content: object) -> list[TextBlock]:
     if isinstance(content, str):
         text = content.strip()
@@ -259,6 +265,68 @@ def _normalize_tool_output(output: object) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
+def _normalize_custom_tool_output(output: object) -> str:
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        stripped = output.strip()
+        if not stripped:
+            return ""
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError:
+            return output
+        if isinstance(data, dict):
+            rendered_output = str(data.get("output", "")).strip()
+            metadata = data.get("metadata")
+            if rendered_output and isinstance(metadata, dict) and metadata:
+                return "\n\n".join(
+                    [
+                        rendered_output,
+                        json.dumps(metadata, ensure_ascii=False, indent=2),
+                    ]
+                )
+            if rendered_output:
+                return rendered_output
+            return json.dumps(data, ensure_ascii=False, indent=2)
+    return _normalize_tool_output(output)
+
+
+def _build_patch_text(changes: object) -> str:
+    if not isinstance(changes, dict) or not changes:
+        return ""
+
+    parts = ["*** Begin Patch"]
+    for path, change in changes.items():
+        if not isinstance(change, dict):
+            continue
+        change_type = change.get("type")
+        move_path = change.get("move_path")
+        if change_type == "add":
+            parts.append(f"*** Add File: {path}")
+            content = str(change.get("content", ""))
+            parts.extend(f"+{line}" for line in content.split("\n"))
+            continue
+        if change_type == "update":
+            parts.append(f"*** Update File: {path}")
+            if move_path:
+                parts.append(f"*** Move to: {move_path}")
+            diff = str(change.get("unified_diff", "")).strip("\n")
+            if diff:
+                parts.extend(diff.split("\n"))
+            continue
+    parts.append("*** End Patch")
+    return "\n".join(parts)
+
+
+def _build_patch_result(payload: dict) -> tuple[str, bool]:
+    stdout = str(payload.get("stdout", "")).strip()
+    stderr = str(payload.get("stderr", "")).strip()
+    success = bool(payload.get("success"))
+    parts = [part for part in (stdout, stderr) if part]
+    return "\n\n".join(parts), not success
+
+
 def _subagent_description(args: dict, spawn_payload: dict | None, agent_id: str) -> str:
     candidates: list[str | None] = [
         args.get("description"),
@@ -291,6 +359,8 @@ def _first_text_item(items: object) -> str | None:
 
 def _build_messages(records: list[dict]) -> list[Message]:
     messages: list[Message] = []
+    tool_use_ids: set[str] = set()
+    tool_result_ids: set[str] = set()
     for record in records:
         record_type = record.get("type")
         payload = record.get("payload", {})
@@ -308,6 +378,43 @@ def _build_messages(records: list[dict]) -> list[Message]:
                 )
             continue
 
+        if record_type == "event_msg" and payload.get("type") == "patch_apply_end":
+            call_id = payload.get("call_id", "")
+            patch_text = _build_patch_text(payload.get("changes"))
+            if call_id and patch_text and call_id not in tool_use_ids:
+                messages.append(
+                    Message(
+                        role="assistant",
+                        blocks=[
+                            ToolUseBlock(
+                                id=call_id,
+                                name="apply_patch",
+                                input={"patch": patch_text},
+                            )
+                        ],
+                        timestamp=timestamp,
+                    )
+                )
+                tool_use_ids.add(call_id)
+            if call_id:
+                result_content, is_error = _build_patch_result(payload)
+                if result_content and call_id not in tool_result_ids:
+                    messages.append(
+                        Message(
+                            role="user",
+                            blocks=[
+                                ToolResultBlock(
+                                    tool_use_id=call_id,
+                                    content=result_content,
+                                    is_error=is_error,
+                                )
+                            ],
+                            timestamp=timestamp,
+                        )
+                    )
+                    tool_result_ids.add(call_id)
+            continue
+
         if record_type != "response_item":
             continue
 
@@ -319,12 +426,13 @@ def _build_messages(records: list[dict]) -> list[Message]:
             continue
 
         if payload_type == "function_call":
+            call_id = payload.get("call_id", "")
             messages.append(
                 Message(
                     role="assistant",
                     blocks=[
                         ToolUseBlock(
-                            id=payload.get("call_id", ""),
+                            id=call_id,
                             name=payload.get("name", ""),
                             input=_parse_tool_input(payload.get("arguments", "")),
                         )
@@ -332,23 +440,68 @@ def _build_messages(records: list[dict]) -> list[Message]:
                     timestamp=timestamp,
                 )
             )
+            if call_id:
+                tool_use_ids.add(call_id)
             continue
 
         if payload_type == "function_call_output":
+            call_id = payload.get("call_id", "")
             content = _normalize_tool_output(payload.get("output", ""))
-            if content:
+            if content and call_id not in tool_result_ids:
                 messages.append(
                     Message(
                         role="user",
                         blocks=[
                             ToolResultBlock(
-                                tool_use_id=payload.get("call_id", ""),
+                                tool_use_id=call_id,
                                 content=content,
                             )
                         ],
                         timestamp=timestamp,
                     )
                 )
+                if call_id:
+                    tool_result_ids.add(call_id)
+            continue
+
+        if payload_type == "custom_tool_call":
+            call_id = payload.get("call_id", "")
+            name = payload.get("name", "")
+            if call_id and call_id not in tool_use_ids and name:
+                messages.append(
+                    Message(
+                        role="assistant",
+                        blocks=[
+                            ToolUseBlock(
+                                id=call_id,
+                                name=name,
+                                input=_parse_custom_tool_input(name, payload.get("input", "")),
+                            )
+                        ],
+                        timestamp=timestamp,
+                    )
+                )
+                tool_use_ids.add(call_id)
+            continue
+
+        if payload_type == "custom_tool_call_output":
+            call_id = payload.get("call_id", "")
+            content = _normalize_custom_tool_output(payload.get("output", ""))
+            if content and call_id not in tool_result_ids:
+                messages.append(
+                    Message(
+                        role="user",
+                        blocks=[
+                            ToolResultBlock(
+                                tool_use_id=call_id,
+                                content=content,
+                            )
+                        ],
+                        timestamp=timestamp,
+                    )
+                )
+                if call_id:
+                    tool_result_ids.add(call_id)
 
     return _merge_assistant_turns(messages)
 
