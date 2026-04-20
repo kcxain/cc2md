@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cc2md"
-version = "0.2.0"
-description = "Convert Claude Code chat sessions to Markdown"
+version = "0.3.0"
+description = "Convert Claude Code or Codex chat sessions to Markdown"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-keywords = ["claude", "claude-code", "markdown", "chat", "export"]
+keywords = ["claude", "codex", "claude-code", "markdown", "chat", "export"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
