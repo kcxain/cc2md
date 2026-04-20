@@ -10,6 +10,7 @@ from .formats.markdown import MarkdownFormat
 from .models import Session
 from .sources.base import SessionMeta
 from .sources.claude_code import ClaudeCodeSource
+from .sources.codex import CodexSource
 
 
 def _print_table(sessions: list[SessionMeta]) -> None:
@@ -66,11 +67,12 @@ def _write_result(result: RenderResult, output: str | None, stem: str, fmt: Mark
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Convert Claude Code chat sessions to Markdown",
+        description="Convert Claude Code or Codex chat sessions to Markdown",
         epilog=(
             "Examples:\n"
             "  cc2md --list\n"
             "  cc2md --latest -o chat.md\n"
+            "  cc2md --agent codex --latest -o log\n"
             "  cc2md --all -d ./exports/\n"
             "  cc2md /path/to/session.jsonl"
         ),
@@ -84,14 +86,20 @@ def main() -> None:
     parser.add_argument("--list", "-l", action="store_true", help="List all sessions")
     parser.add_argument("--latest", action="store_true", help="Convert the most recent session")
     parser.add_argument("--all", action="store_true", help="Convert all sessions")
+    parser.add_argument(
+        "--agent",
+        choices=("claude", "codex"),
+        default="claude",
+        help="Session source backend to read from",
+    )
     parser.add_argument("--project", "-p", help="Filter sessions by project path substring")
     parser.add_argument(
         "--dir",
         metavar="PATH",
         help=(
-            "Directory to scan instead of ~/.claude/projects/. "
-            "Auto-detected: contains *.jsonl → project dir; "
-            "otherwise → projects dir (subdirs are project dirs)."
+            "Directory to scan instead of the default source directory. "
+            "For Claude: project dir or ~/.claude/projects/. "
+            "For Codex: ~/.codex/sessions/ or any nested session directory."
         ),
     )
     parser.add_argument(
@@ -104,10 +112,8 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    source = ClaudeCodeSource(
-        scan_dir=Path(args.dir) if args.dir else None,
-        project_filter=args.project,
-    )
+    source_cls = ClaudeCodeSource if args.agent == "claude" else CodexSource
+    source = source_cls(scan_dir=Path(args.dir) if args.dir else None, project_filter=args.project)
     fmt = MarkdownFormat(
         include_subagents=not args.no_subagents,
         include_tool_results=not args.no_tool_results,
