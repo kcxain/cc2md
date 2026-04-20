@@ -58,6 +58,112 @@ def _derive_title(text: str | None) -> str | None:
     return title[:80]
 
 
+def _format_sandbox_policy(policy: object) -> str | None:
+    if not isinstance(policy, dict):
+        return None
+    sandbox_type = policy.get("type")
+    network_access = policy.get("network_access")
+    parts: list[str] = []
+    if sandbox_type:
+        parts.append(str(sandbox_type))
+    if network_access is not None:
+        parts.append("network=on" if network_access else "network=off")
+    return ", ".join(parts) if parts else None
+
+
+def _collect_metadata(records: list[dict]) -> dict[str, object]:
+    session_meta: dict | None = None
+    turn_context: dict | None = None
+    last_token_count: dict | None = None
+
+    for record in records:
+        record_type = record.get("type")
+        if record_type == "session_meta" and session_meta is None:
+            payload = record.get("payload")
+            if isinstance(payload, dict):
+                session_meta = payload
+            continue
+        if record_type == "turn_context" and turn_context is None:
+            payload = record.get("payload")
+            if isinstance(payload, dict):
+                turn_context = payload
+            continue
+        if record_type == "event_msg" and record.get("payload", {}).get("type") == "token_count":
+            payload = record.get("payload")
+            if isinstance(payload, dict):
+                last_token_count = payload
+
+    metadata: dict[str, object] = {}
+    if isinstance(session_meta, dict):
+        for src_key, dest_key in (
+            ("originator", "originator"),
+            ("cli_version", "cli_version"),
+            ("model_provider", "model_provider"),
+        ):
+            value = session_meta.get(src_key)
+            if value:
+                metadata[dest_key] = value
+        git = session_meta.get("git")
+        if isinstance(git, dict):
+            if git.get("commit_hash"):
+                metadata["git_commit"] = git["commit_hash"]
+            if git.get("branch"):
+                metadata["git_branch"] = git["branch"]
+        source = session_meta.get("source")
+        if source:
+            metadata["session_source"] = source
+
+    if isinstance(turn_context, dict):
+        for src_key, dest_key in (
+            ("model", "model"),
+            ("effort", "reasoning_effort"),
+            ("approval_policy", "approval_policy"),
+            ("personality", "personality"),
+            ("summary", "summary"),
+        ):
+            value = turn_context.get(src_key)
+            if value:
+                metadata[dest_key] = value
+        sandbox = _format_sandbox_policy(turn_context.get("sandbox_policy"))
+        if sandbox:
+            metadata["sandbox_policy"] = sandbox
+        collaboration_mode = turn_context.get("collaboration_mode", {})
+        if isinstance(collaboration_mode, dict) and collaboration_mode.get("mode"):
+            metadata["collaboration_mode"] = collaboration_mode["mode"]
+
+    if isinstance(last_token_count, dict):
+        info = last_token_count.get("info", {})
+        if isinstance(info, dict):
+            total = info.get("total_token_usage", {})
+            if isinstance(total, dict):
+                for src_key, dest_key in (
+                    ("input_tokens", "input_tokens"),
+                    ("cached_input_tokens", "cached_input_tokens"),
+                    ("output_tokens", "output_tokens"),
+                    ("reasoning_output_tokens", "reasoning_output_tokens"),
+                    ("total_tokens", "total_tokens"),
+                ):
+                    value = total.get(src_key)
+                    if value is not None:
+                        metadata[dest_key] = value
+            last = info.get("last_token_usage", {})
+            if isinstance(last, dict):
+                value = last.get("total_tokens")
+                if value is not None:
+                    metadata["last_turn_tokens"] = value
+            if info.get("model_context_window") is not None:
+                metadata["model_context_window"] = info["model_context_window"]
+        rate_limits = last_token_count.get("rate_limits", {})
+        if isinstance(rate_limits, dict):
+            if rate_limits.get("plan_type"):
+                metadata["plan_type"] = rate_limits["plan_type"]
+            primary = rate_limits.get("primary", {})
+            if isinstance(primary, dict) and primary.get("used_percent") is not None:
+                metadata["primary_rate_limit_used_percent"] = primary["used_percent"]
+
+    return metadata
+
+
 def _parse_tool_input(raw: object) -> dict:
     if isinstance(raw, dict):
         return raw
@@ -443,4 +549,5 @@ class CodexSource(BaseSource):
             messages=messages,
             subconversations=linked,
             unlinked_subconversations=unlinked,
+            metadata=_collect_metadata(records),
         )

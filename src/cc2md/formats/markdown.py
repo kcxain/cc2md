@@ -93,6 +93,50 @@ def _extract_patch_text(inp: dict) -> str:
     return ""
 
 
+def _format_metadata_value(value: object) -> str:
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
+def _codex_metadata_lines(metadata: dict[str, object]) -> list[str]:
+    if not metadata:
+        return []
+
+    ordered_fields = [
+        ("model", "Model"),
+        ("model_provider", "Model Provider"),
+        ("reasoning_effort", "Reasoning Effort"),
+        ("model_context_window", "Context Window"),
+        ("originator", "Originator"),
+        ("cli_version", "CLI Version"),
+        ("session_source", "Session Source"),
+        ("collaboration_mode", "Collaboration Mode"),
+        ("approval_policy", "Approval Policy"),
+        ("sandbox_policy", "Sandbox"),
+        ("personality", "Personality"),
+        ("plan_type", "Plan"),
+        ("summary", "Summary"),
+        ("input_tokens", "Input Tokens"),
+        ("cached_input_tokens", "Cached Input Tokens"),
+        ("output_tokens", "Output Tokens"),
+        ("reasoning_output_tokens", "Reasoning Output Tokens"),
+        ("total_tokens", "Total Tokens"),
+        ("last_turn_tokens", "Last Turn Tokens"),
+        ("primary_rate_limit_used_percent", "Primary Rate Limit Used %"),
+        ("git_branch", "Git Branch"),
+        ("git_commit", "Git Commit"),
+    ]
+
+    lines = ["## Codex Metadata", ""]
+    for key, label in ordered_fields:
+        if key not in metadata:
+            continue
+        lines.append(f"**{label}:** `{_format_metadata_value(metadata[key])}`  ")
+    lines.extend(["", "---", ""])
+    return lines
+
+
 class MarkdownFormat(BaseFormat):
     """Renders a Session as GitHub-flavoured Markdown.
 
@@ -204,6 +248,7 @@ class MarkdownFormat(BaseFormat):
         if ts:
             lines.append(f"**Date:** {ts}  ")
         lines.extend(["", "---", ""])
+        lines.extend(_codex_metadata_lines(session.metadata))
         return lines
 
     # ------------------------------------------------------------------
