@@ -107,6 +107,32 @@ def _fenced_block(content: str, info: str = "") -> str:
     return f"{fence}{info_suffix}\n{content}\n{fence}"
 
 
+def _details_block(summary: str, body: str) -> str:
+    return f"<details><summary>{summary}</summary>\n\n{body}\n\n</details>"
+
+
+def _is_edit_tool(name: str) -> bool:
+    lower_name = name.lower()
+    return (
+        name in {"Write", "Add", "Edit", "MultiEdit", "Delete", "DeleteFile"}
+        or lower_name
+        in {
+            "write",
+            "add",
+            "create_file",
+            "edit",
+            "replace_in_file",
+            "multiedit",
+            "multi_edit",
+            "apply_patch",
+            "applypatch",
+            "delete",
+            "delete_file",
+            "remove_file",
+        }
+    )
+
+
 def _format_metadata_value(value: object) -> str:
     if isinstance(value, dict):
         return json.dumps(value, ensure_ascii=False, sort_keys=True)
@@ -333,24 +359,39 @@ class MarkdownFormat(BaseFormat):
                 continue
 
             rendered_tool = self._render_tool_use(block)
-            if rendered_tool:
-                parts.append(rendered_tool)
-
+            rendered_results: list[str] = []
             if self.include_tool_results:
-                for result in result_map.get(block.id, []):
-                    rendered_result = self._render_tool_result_for_call(block, result)
-                    if rendered_result:
-                        parts.append(rendered_result)
+                rendered_results = [
+                    rendered_result
+                    for result in result_map.get(block.id, [])
+                    if (rendered_result := self._render_tool_result_for_call(block, result))
+                ]
 
+            subagent_rendered: str | None = None
             if self.include_subagents and block.name in _AGENT_TOOL_NAMES:
                 sub = session.subconversations.get(block.id)
                 if sub:
                     if subagent_links:
                         filename = subagent_links[block.id]
                         desc = sub.description or "Subagent"
-                        parts.append(f"[→ Subagent: {desc}]({filename})")
+                        subagent_rendered = f"[→ Subagent: {desc}]({filename})"
                     else:
-                        parts.append(self._render_subconversation_inline(sub))
+                        subagent_rendered = self._render_subconversation_inline(sub)
+
+            if not any([rendered_tool, rendered_results, subagent_rendered]):
+                continue
+
+            if _is_edit_tool(block.name):
+                rendered_parts = [part for part in [rendered_tool, *rendered_results, subagent_rendered] if part]
+                parts.append("\n\n".join(rendered_parts))
+                continue
+
+            if rendered_tool:
+                parts.append(rendered_tool)
+            for rendered_result in rendered_results:
+                parts.append(_details_block(f"Result: {block.name}", rendered_result))
+            if subagent_rendered:
+                parts.append(subagent_rendered)
 
         unmatched_results = [
             result
@@ -362,7 +403,7 @@ class MarkdownFormat(BaseFormat):
             for result in unmatched_results:
                 rendered_result = self._render_orphan_tool_result(result)
                 if rendered_result:
-                    parts.append(rendered_result)
+                    parts.append(_details_block("Tool Result", rendered_result))
 
         return "\n\n".join(part for part in parts if part.strip())
 
