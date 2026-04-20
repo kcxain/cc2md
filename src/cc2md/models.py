@@ -53,6 +53,7 @@ class SubConversation:
     description: str
     agent_type: str
     messages: list[Message] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

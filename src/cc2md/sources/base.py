@@ -17,6 +17,7 @@ class SessionMeta:
     project: str
     title: str | None = None
     timestamp: str | None = None
+    sort_timestamp: str | None = None
     display_project: str | None = None
 
     def get_display_project(self) -> str:

@@ -104,6 +104,8 @@ def _codex_metadata_lines(metadata: dict[str, object]) -> list[str]:
         return []
 
     ordered_fields = [
+        ("duration", "Duration"),
+        ("duration_seconds", "Duration Seconds"),
         ("model", "Model"),
         ("model_provider", "Model Provider"),
         ("reasoning_effort", "Reasoning Effort"),
@@ -126,6 +128,8 @@ def _codex_metadata_lines(metadata: dict[str, object]) -> list[str]:
         ("primary_rate_limit_used_percent", "Primary Rate Limit Used %"),
         ("git_branch", "Git Branch"),
         ("git_commit", "Git Commit"),
+        ("first_event_at", "First Event At"),
+        ("last_event_at", "Last Event At"),
     ]
 
     lines = ["## Codex Metadata", ""]
@@ -485,5 +489,6 @@ class MarkdownFormat(BaseFormat):
             "---",
             "",
         ]
+        lines.extend(_codex_metadata_lines(sub.metadata))
         self._render_subconversation_messages(sub, lines)
         return "\n".join(lines)
