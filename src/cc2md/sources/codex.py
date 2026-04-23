@@ -521,6 +521,44 @@ def _find_rollout_by_id(sessions_root: Path, session_id: str) -> Path | None:
     return matches[0] if matches else None
 
 
+def _build_file_meta(rollout_path: Path, sessions_root: Path) -> SessionMeta | None:
+    session_meta = _read_session_meta(rollout_path)
+    if session_meta is None:
+        return None
+
+    session_id = session_meta.get("id")
+    timestamp = session_meta.get("timestamp")
+    cwd = session_meta.get("cwd", "")
+    if not session_id or not cwd:
+        return None
+
+    title: str | None = None
+    last_timestamp = timestamp
+    try:
+        with open(rollout_path) as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("timestamp"):
+                    last_timestamp = record["timestamp"]
+                if record.get("type") == "event_msg" and record.get("payload", {}).get("type") == "user_message":
+                    title = _derive_title(record["payload"].get("message"))
+    except OSError:
+        pass
+
+    return SessionMeta(
+        ref={"rollout": rollout_path, "sessions_root": sessions_root},
+        session_id=session_id,
+        project=cwd,
+        title=title,
+        timestamp=timestamp,
+        sort_timestamp=last_timestamp,
+        display_project=cwd,
+    )
+
+
 def _load_subconversation(
     rollout_path: Path,
     agent_id: str,
@@ -650,40 +688,30 @@ class CodexSource(BaseSource):
             return None
         if _is_subagent_source(session_meta.get("source")):
             return None
-
-        session_id = session_meta.get("id")
-        timestamp = session_meta.get("timestamp")
-        cwd = session_meta.get("cwd", "")
-        if not session_id or not cwd:
+        meta = _build_file_meta(rollout_path, sessions_root)
+        if meta is None:
             return None
-        if self._project_filter and self._project_filter.lower() not in cwd.lower():
+        if self._project_filter and self._project_filter.lower() not in meta.project.lower():
             return None
+        return meta
 
-        title: str | None = None
-        last_timestamp = timestamp
-        try:
-            with open(rollout_path) as f:
-                for line in f:
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if record.get("timestamp"):
-                        last_timestamp = record["timestamp"]
-                    if record.get("type") == "event_msg" and record.get("payload", {}).get("type") == "user_message":
-                        title = _derive_title(record["payload"].get("message"))
-        except OSError:
-            pass
+    def resolve_file(self, path: Path) -> SessionMeta | None:
+        rollout_path = path.expanduser().resolve()
+        sessions_root = (self._scan_dir or self._sessions_dir).expanduser()
+        session_meta = _read_session_meta(rollout_path)
+        if session_meta is None:
+            return None
+        if not _is_subagent_source(session_meta.get("source")):
+            return _build_file_meta(rollout_path, sessions_root)
 
-        return SessionMeta(
-            ref={"rollout": rollout_path, "sessions_root": sessions_root},
-            session_id=session_id,
-            project=cwd,
-            title=title,
-            timestamp=timestamp,
-            sort_timestamp=last_timestamp,
-            display_project=cwd,
-        )
+        thread_spawn = session_meta.get("source", {}).get("subagent", {}).get("thread_spawn", {})
+        parent_id = thread_spawn.get("parent_thread_id")
+        if not parent_id:
+            return _build_file_meta(rollout_path, sessions_root)
+        parent_rollout = _find_rollout_by_id(sessions_root, parent_id)
+        if parent_rollout is None:
+            return _build_file_meta(rollout_path, sessions_root)
+        return _build_file_meta(parent_rollout, sessions_root)
 
     def load(self, meta: SessionMeta) -> Session:
         return self._load_from_path(
@@ -698,34 +726,21 @@ class CodexSource(BaseSource):
 
     def load_file(self, path: Path) -> Session:
         rollout_path = path.expanduser().resolve()
+        sessions_root = (self._scan_dir or self._sessions_dir).expanduser()
+        meta = self.resolve_file(rollout_path)
+        if meta is not None:
+            return self.load(meta)
         session_meta = _read_session_meta(rollout_path) or {}
         session_id = session_meta.get("id") or rollout_path.stem
         cwd = session_meta.get("cwd", "")
         timestamp = session_meta.get("timestamp")
-        title: str | None = None
-
-        try:
-            with open(rollout_path) as f:
-                for line in f:
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if record.get("type") == "event_msg" and record.get("payload", {}).get("type") == "user_message":
-                        title = _derive_title(record["payload"].get("message"))
-                        if title:
-                            break
-        except OSError:
-            pass
-
-        sessions_root = (self._scan_dir or self._sessions_dir).expanduser()
         return self._load_from_path(
             rollout_path=rollout_path,
             sessions_root=sessions_root,
             session_id=session_id,
             project=cwd,
             display_project=cwd,
-            title=title,
+            title=None,
             timestamp=timestamp,
         )
 

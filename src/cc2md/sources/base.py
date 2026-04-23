@@ -42,6 +42,10 @@ class BaseSource(ABC):
         """Load a session directly from a file path, bypassing discovery."""
         ...
 
+    def resolve_file(self, path: Path) -> SessionMeta | None:
+        """Resolve a file path to canonical session metadata when supported."""
+        return None
+
     def find(self, sessions: list[SessionMeta], query: str) -> SessionMeta | None:
         """Find a session by 1-based index, UUID prefix, or title substring."""
         try:

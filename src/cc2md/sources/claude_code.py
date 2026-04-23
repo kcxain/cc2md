@@ -367,6 +367,26 @@ class ClaudeCodeSource(BaseSource):
             timestamp=meta.timestamp,
         )
 
+    def resolve_file(self, path: Path) -> SessionMeta | None:
+        """Resolve a JSONL path to the top-level session metadata when possible.
+
+        For normal session JSONLs this returns metadata for that session.
+        For ``subagents/agent-*.jsonl`` files this attempts to resolve the
+        containing top-level session so CLI output matches ``--latest``.
+        """
+        path = path.resolve()
+        if not path.is_file() or path.suffix != ".jsonl":
+            return None
+
+        if not path.stem.startswith("agent-"):
+            return self._build_meta(path, path.parent)
+
+        direct = self._resolve_parent_session_meta(path)
+        if direct is not None:
+            return direct
+
+        return self._scan_ancestors_for_parent_session(path)
+
     def load_file(self, path: Path) -> Session:
         path = path.resolve()
         sid = path.stem
@@ -397,6 +417,38 @@ class ClaudeCodeSource(BaseSource):
             title=title,
             timestamp=timestamp,
         )
+
+    def _resolve_parent_session_meta(self, path: Path) -> SessionMeta | None:
+        """Resolve ``.../<session_id>/subagents/agent-*.jsonl`` back to ``<session_id>.jsonl``."""
+        if path.parent.name != "subagents":
+            return None
+
+        session_dir = path.parent.parent
+        project_dir = session_dir.parent
+        root_jsonl = project_dir / f"{session_dir.name}.jsonl"
+        if not root_jsonl.exists():
+            return None
+        return self._build_meta(root_jsonl, project_dir)
+
+    def _scan_ancestors_for_parent_session(self, path: Path) -> SessionMeta | None:
+        """Fallback search when the direct subagent layout inference is insufficient."""
+        for ancestor in path.parents:
+            try:
+                jsonl_files = sorted(
+                    p for p in ancestor.glob("*.jsonl")
+                    if not p.stem.startswith("agent-")
+                )
+            except OSError:
+                continue
+
+            for jsonl_file in jsonl_files:
+                candidate = ancestor / jsonl_file.stem / "subagents" / path.name
+                try:
+                    if candidate.exists() and candidate.samefile(path):
+                        return self._build_meta(jsonl_file, ancestor)
+                except OSError:
+                    continue
+        return None
 
     def _load_from_paths(
         self,

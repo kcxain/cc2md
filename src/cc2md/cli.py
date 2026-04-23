@@ -121,12 +121,18 @@ def main() -> None:
 
     # Direct file path — skip discovery
     if args.session and Path(args.session).is_file():
-        session = source.load_file(Path(args.session))
+        path = Path(args.session)
+        meta = source.resolve_file(path)
+        if meta is not None:
+            session = source.load(meta)
+            stem = _session_stem(meta)
+        else:
+            session = source.load_file(path)
+            stem = session.session_id[:8]
         result = fmt.render(session)
         if result.is_single_file and not args.output:
             print(result.single_content())
         else:
-            stem = session.session_id[:8]
             _write_result(result, args.output, stem, fmt)
         return
 
