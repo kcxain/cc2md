@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cc2md"
-version = "0.3.0"
+version = "1.0"
 description = "Convert Claude Code or Codex chat sessions to Markdown"
 readme = "README.md"
 license = "MIT"
