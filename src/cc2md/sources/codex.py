@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -17,14 +18,116 @@ CODEX_DIR = Path.home() / ".codex"
 SESSIONS_DIR = CODEX_DIR / "sessions"
 
 
-def _read_jsonl(path: Path) -> list[dict]:
-    records: list[dict] = []
-    with open(path) as f:
-        for line in f:
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
+def _escape_multiline_json_strings(text: str) -> str:
+    """Make best-effort repairs for rollout files with raw newlines in strings."""
+    out: list[str] = []
+    in_string = False
+    escape = False
+
+    for ch in text:
+        if in_string:
+            if escape:
+                out.append(ch)
+                escape = False
                 continue
+            if ch == "\\":
+                out.append(ch)
+                escape = True
+                continue
+            if ch == '"':
+                out.append(ch)
+                in_string = False
+                continue
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                out.append("\\r")
+                continue
+            if ch == "\t":
+                out.append("\\t")
+                continue
+            if ord(ch) < 0x20:
+                out.append(f"\\u{ord(ch):04x}")
+                continue
+            out.append(ch)
+            continue
+
+        out.append(ch)
+        if ch == '"':
+            in_string = True
+            escape = False
+
+    return "".join(out)
+
+
+def _parse_malformed_output_chunk(chunk: str) -> dict | None:
+    match = re.match(
+        (
+            r'^\{"timestamp":"(?P<timestamp>[^"]+)","type":"(?P<record_type>[^"]+)",'
+            r'"payload":\{"type":"(?P<payload_type>function_call_output|custom_tool_call_output)",'
+            r'"call_id":"(?P<call_id>[^"]+)","output":"'
+        ),
+        chunk,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return None
+
+    raw_output = chunk[match.end():]
+    if raw_output.endswith('"}}'):
+        raw_output = raw_output[:-3]
+
+    output = (
+        raw_output
+        .replace("\\r", "\r")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace('\\"', '"')
+        .replace("\\\\", "\\")
+    )
+
+    return {
+        "timestamp": match.group("timestamp"),
+        "type": match.group("record_type"),
+        "payload": {
+            "type": match.group("payload_type"),
+            "call_id": match.group("call_id"),
+            "output": output,
+        },
+    }
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    # Some Codex rollout files are not strict JSONL: one logical record can
+    # span multiple physical lines, and malformed tool outputs can even cause
+    # the next `{"timestamp": ...}` record start to appear mid-line. Split on
+    # the rollout record prefix itself, then repair string contents inside each
+    # chunk before decoding.
+    try:
+        text = path.read_text()
+    except OSError:
+        return []
+
+    records: list[dict] = []
+    starts = [match.start() for match in re.finditer(r'\{\s*"timestamp"\s*:', text)]
+    if not starts:
+        return records
+
+    for idx, start in enumerate(starts):
+        end = starts[idx + 1] if idx + 1 < len(starts) else len(text)
+        chunk = _escape_multiline_json_strings(text[start:end].strip())
+        if not chunk:
+            continue
+        try:
+            value = json.loads(chunk)
+        except json.JSONDecodeError:
+            value = _parse_malformed_output_chunk(chunk)
+            if value is None:
+                continue
+        if isinstance(value, dict):
+            records.append(value)
+
     return records
 
 
@@ -252,7 +355,17 @@ def _normalize_tool_output(output: object) -> str:
         return json.dumps(output, ensure_ascii=False, indent=2)
 
     if output.startswith("Chunk ID:") and "\nOutput:\n" in output:
-        output = output.split("\nOutput:\n", 1)[1]
+        header, body = output.split("\nOutput:\n", 1)
+        if body.strip():
+            output = body
+        else:
+            header_lines = [
+                line
+                for line in header.splitlines()
+                if line
+                and not line.startswith(("Chunk ID:", "Wall time:", "Original token count:"))
+            ]
+            output = "\n".join(header_lines).strip()
 
     stripped = output.strip()
     if not stripped:

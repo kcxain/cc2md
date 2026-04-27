@@ -40,12 +40,7 @@ def _subagent_filename(description: str, agent_id: str, used: set[str], ext: str
 
 
 def _truncate_lines(lines: list[str], keep: int = 60) -> list[str]:
-    if len(lines) <= keep:
-        return lines
-    head = keep // 2
-    tail = keep - head
-    omitted = len(lines) - keep
-    return lines[:head] + [f"... ({omitted} lines omitted) ..."] + lines[-tail:]
+    return lines
 
 
 def _prefixed_lines(text: str, prefix: str) -> list[str]:
@@ -304,6 +299,8 @@ class MarkdownFormat(BaseFormat):
         lines: list[str],
         subagent_links: dict[str, str] | None,
     ) -> None:
+        all_tool_results = self._collect_all_tool_results(messages)
+        consumed_tool_results: set[str] = set()
         index = 0
         while index < len(messages):
             msg = messages[index]
@@ -319,25 +316,43 @@ class MarkdownFormat(BaseFormat):
                 index += 1
                 continue
 
-            result_map, next_index = self._collect_tool_results(messages, index + 1)
+            result_map: dict[str, list[ToolResultBlock]] = {}
+            for block in msg.blocks:
+                if not isinstance(block, ToolUseBlock):
+                    continue
+                if block.id in all_tool_results:
+                    result_map[block.id] = all_tool_results[block.id]
+                    consumed_tool_results.add(block.id)
             rendered = self._render_assistant_message(msg, session, result_map, subagent_links)
             if rendered.strip():
                 lines.append(f"## Assistant\n\n{rendered}\n")
-            index = next_index
+            index += 1
 
-    def _collect_tool_results(
+        if self.include_tool_results:
+            orphan_parts: list[str] = []
+            for tool_use_id, results in all_tool_results.items():
+                if tool_use_id in consumed_tool_results:
+                    continue
+                for result in results:
+                    rendered_result = self._render_orphan_tool_result(result)
+                    if rendered_result:
+                        orphan_parts.append(_details_block("Tool Result", rendered_result))
+            if orphan_parts:
+                orphan_block = "\n\n".join(orphan_parts)
+                lines.append(f"## Assistant\n\n{orphan_block}\n")
+
+    def _collect_all_tool_results(
         self,
         messages: list[Message],
-        start_index: int,
-    ) -> tuple[dict[str, list[ToolResultBlock]], int]:
+    ) -> dict[str, list[ToolResultBlock]]:
         result_map: dict[str, list[ToolResultBlock]] = {}
-        index = start_index
-        while index < len(messages) and messages[index].role == "user" and messages[index].is_tool_result_only:
-            for block in messages[index].blocks:
+        for msg in messages:
+            if msg.role != "user" or not msg.is_tool_result_only:
+                continue
+            for block in msg.blocks:
                 if isinstance(block, ToolResultBlock):
                     result_map.setdefault(block.tool_use_id, []).append(block)
-            index += 1
-        return result_map, index
+        return result_map
 
     def _render_assistant_message(
         self,
@@ -538,15 +553,7 @@ class MarkdownFormat(BaseFormat):
         prefix = f"**Result: {tool.name}**"
         if block.is_error:
             prefix += " `error`"
-        content = block.content
-        lines = content.split("\n")
-        if len(lines) > 50:
-            content = (
-                "\n".join(lines[:25])
-                + f"\n\n... ({len(lines) - 50} lines omitted) ...\n\n"
-                + "\n".join(lines[-25:])
-            )
-        return f"{prefix}\n{_fenced_block(content)}"
+        return f"{prefix}\n{_fenced_block(block.content)}"
 
     def _render_orphan_tool_result(self, block: ToolResultBlock) -> str:
         if not block.content:
