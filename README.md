@@ -8,7 +8,7 @@ Convert [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or Codex c
 ## Install
 
 ```bash
-pip install cc2md
+pip install .
 ```
 
 ## Quick Start
