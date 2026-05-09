@@ -89,6 +89,96 @@ class ClaudeCodeSourceResolveFileTests(unittest.TestCase):
             self.assertEqual(set(session.subconversations), {"toolu_1"})
 
 class CodexSourceResolveFileTests(unittest.TestCase):
+    def test_resolve_codex_direct_subagent_path_infers_sessions_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_dir = Path(tmp) / "home" / ".codex" / "sessions" / "2026" / "04" / "23"
+            main_path = session_dir / "rollout-2026-04-23T16-53-25-019db98b-4563-75b0-9cab-92b560524710.jsonl"
+            sub_path = session_dir / "rollout-2026-04-23T16-54-32-019db98c-49b6-7590-a3c9-ce0cf1ad88c7.jsonl"
+
+            _write_jsonl(
+                main_path,
+                [
+                    {
+                        "timestamp": "2026-04-23T08:53:25Z",
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "019db98b-4563-75b0-9cab-92b560524710",
+                            "timestamp": "2026-04-23T08:53:25Z",
+                            "cwd": "/tmp/demo",
+                            "source": "cli",
+                        },
+                    },
+                    {
+                        "timestamp": "2026-04-23T08:54:32Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "spawn_agent",
+                            "arguments": "{\"message\":\"任务1\"}",
+                            "call_id": "call_spawn_1",
+                        },
+                    },
+                    {
+                        "timestamp": "2026-04-23T08:54:32Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "collab_agent_spawn_end",
+                            "call_id": "call_spawn_1",
+                            "new_thread_id": "019db98c-49b6-7590-a3c9-ce0cf1ad88c7",
+                            "new_agent_role": "worker",
+                            "prompt": "任务1",
+                        },
+                    },
+                ],
+            )
+            _write_jsonl(
+                sub_path,
+                [
+                    {
+                        "timestamp": "2026-04-23T08:54:33Z",
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "019db98c-49b6-7590-a3c9-ce0cf1ad88c7",
+                            "timestamp": "2026-04-23T08:54:32Z",
+                            "cwd": "/tmp/demo",
+                            "source": {
+                                "subagent": {
+                                    "thread_spawn": {
+                                        "parent_thread_id": "019db98b-4563-75b0-9cab-92b560524710"
+                                    }
+                                }
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": "2026-04-23T08:54:34Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "子线程内容"}],
+                        },
+                    },
+                ],
+            )
+
+            source = CodexSource()
+            meta = source.resolve_file(sub_path)
+            session = source.load(meta) if meta is not None else None
+
+            self.assertIsNotNone(meta)
+            assert meta is not None
+            self.assertEqual(meta.session_id, "019db98b-4563-75b0-9cab-92b560524710")
+            self.assertEqual(meta.ref["rollout"].resolve(), main_path.resolve())
+            self.assertEqual(meta.ref["sessions_root"].resolve(), (Path(tmp) / "home" / ".codex" / "sessions").resolve())
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(set(session.subconversations), {"call_spawn_1"})
+            rendered = MarkdownFormat().render(session)
+            self.assertFalse(rendered.is_single_file)
+            self.assertIn("index.md", rendered.files)
+            self.assertTrue(any("子线程内容" in content for content in rendered.files.values()))
+
     def test_resolve_codex_subagent_rollout_returns_main_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             session_dir = Path(tmp)

@@ -354,6 +354,23 @@ class MarkdownFormat(BaseFormat):
                     result_map.setdefault(block.tool_use_id, []).append(block)
         return result_map
 
+    def _collect_tool_results(
+        self,
+        messages: list[Message],
+        start_index: int,
+    ) -> tuple[dict[str, list[ToolResultBlock]], int]:
+        result_map: dict[str, list[ToolResultBlock]] = {}
+        index = start_index
+        while index < len(messages):
+            msg = messages[index]
+            if msg.role != "user" or not msg.is_tool_result_only:
+                break
+            for block in msg.blocks:
+                if isinstance(block, ToolResultBlock):
+                    result_map.setdefault(block.tool_use_id, []).append(block)
+            index += 1
+        return result_map, index
+
     def _render_assistant_message(
         self,
         msg: Message,

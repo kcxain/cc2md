@@ -634,6 +634,13 @@ def _find_rollout_by_id(sessions_root: Path, session_id: str) -> Path | None:
     return matches[0] if matches else None
 
 
+def _infer_sessions_root(rollout_path: Path) -> Path:
+    for parent in rollout_path.parents:
+        if parent.name == "sessions":
+            return parent
+    return rollout_path.parent
+
+
 def _build_file_meta(rollout_path: Path, sessions_root: Path) -> SessionMeta | None:
     session_meta = _read_session_meta(rollout_path)
     if session_meta is None:
@@ -810,7 +817,11 @@ class CodexSource(BaseSource):
 
     def resolve_file(self, path: Path) -> SessionMeta | None:
         rollout_path = path.expanduser().resolve()
-        sessions_root = (self._scan_dir or self._sessions_dir).expanduser()
+        sessions_root = (
+            self._scan_dir.expanduser().resolve()
+            if self._scan_dir is not None
+            else _infer_sessions_root(rollout_path)
+        )
         session_meta = _read_session_meta(rollout_path)
         if session_meta is None:
             return None
@@ -839,7 +850,11 @@ class CodexSource(BaseSource):
 
     def load_file(self, path: Path) -> Session:
         rollout_path = path.expanduser().resolve()
-        sessions_root = (self._scan_dir or self._sessions_dir).expanduser()
+        sessions_root = (
+            self._scan_dir.expanduser().resolve()
+            if self._scan_dir is not None
+            else _infer_sessions_root(rollout_path)
+        )
         meta = self.resolve_file(rollout_path)
         if meta is not None:
             return self.load(meta)
