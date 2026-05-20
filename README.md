@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/cc2md)](https://pypi.org/project/cc2md/)
 [![License](https://img.shields.io/github/license/kcxain/cc2md)](LICENSE)
 
-Convert [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or Codex chat sessions to Markdown.
+Convert [Claude Code](https://docs.anthropic.com/en/docs/claude-code), Codex, or Kimi Code chat sessions to Markdown.
 
 ## Install
 
@@ -19,6 +19,9 @@ cc2md --agent claude --latest -o log
 
 # Most recent Codex session
 cc2md --agent codex --latest -o log
+
+# Most recent Kimi Code session
+cc2md --agent kimicode --latest -o log
 ```
 
 ## Usage
@@ -27,6 +30,7 @@ cc2md --agent codex --latest -o log
 cc2md --list                         # list all sessions
 cc2md --latest -o log                # most recent session → log.md (or log/)
 cc2md --agent codex --latest -o log  # most recent Codex session
+cc2md --agent kimicode --latest -o log # most recent Kimi Code session
 cc2md 1 -o log                       # by index from --list
 cc2md a1b2c3 -o log                  # by UUID prefix
 cc2md "auth middleware" -o log       # by title substring
@@ -51,7 +55,7 @@ log/
 | `--list`, `-l` | List available sessions |
 | `--latest` | Most recent session |
 | `--all` | Convert all sessions |
-| `--agent` | Source backend: `claude` (default) or `codex` |
+| `--agent` | Source backend: `claude` (default), `codex`, or `kimicode` |
 | `--project`, `-p` | Filter by project path substring |
 | `--dir` | Custom source directory |
 | `--output`, `-o` | Output path |
