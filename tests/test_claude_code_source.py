@@ -9,6 +9,7 @@ from cc2md.formats.markdown import MarkdownFormat
 from cc2md.models import Message, Session, ToolResultBlock, ToolUseBlock
 from cc2md.sources.claude_code import ClaudeCodeSource
 from cc2md.sources.codex import CodexSource
+from cc2md.sources.kimicode import KimiCodeSource
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
@@ -178,6 +179,170 @@ class CodexSourceResolveFileTests(unittest.TestCase):
             self.assertFalse(rendered.is_single_file)
             self.assertIn("index.md", rendered.files)
             self.assertTrue(any("子线程内容" in content for content in rendered.files.values()))
+
+
+class KimiCodeSourceTests(unittest.TestCase):
+    def test_discover_and_render_kimicode_wire_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_dir = Path(tmp) / "project-hash" / "session-123"
+            _write_jsonl(
+                session_dir / "wire.jsonl",
+                [
+                    {"type": "metadata", "protocol_version": "1.10"},
+                    {
+                        "timestamp": 1779113209.2948103,
+                        "message": {
+                            "type": "TurnBegin",
+                            "payload": {"user_input": "生成一个 bangc gemm 算子"},
+                        },
+                    },
+                    {
+                        "timestamp": 1779113214.0,
+                        "message": {
+                            "type": "ToolCall",
+                            "payload": {
+                                "id": "tool_shell",
+                                "function": {"name": "Shell", "arguments": "{\"command\": \"echo "},
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": 1779113214.1,
+                        "message": {
+                            "type": "ToolCallPart",
+                            "payload": {"arguments_part": "hello\"}"},
+                        },
+                    },
+                    {
+                        "timestamp": 1779113215.0,
+                        "message": {
+                            "type": "ToolResult",
+                            "payload": {
+                                "tool_call_id": "tool_shell",
+                                "return_value": {"is_error": False, "output": "hello\n"},
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": 1779113216.0,
+                        "message": {
+                            "type": "ContentPart",
+                            "payload": {"type": "text", "text": "任务完成"},
+                        },
+                    },
+                ],
+            )
+            (session_dir / "state.json").write_text(
+                json.dumps({"custom_title": "Kimi Demo", "approval": {"afk": True}, "todos": [{"status": "done"}]})
+            )
+
+            source = KimiCodeSource(scan_dir=Path(tmp))
+            sessions = source.discover()
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(sessions[0].session_id, "session-123")
+            self.assertEqual(sessions[0].title, "Kimi Demo")
+
+            session = source.load(sessions[0])
+            rendered = MarkdownFormat().render(session).single_content()
+            self.assertIn("生成一个 bangc gemm 算子", rendered)
+            self.assertIn("Shell", rendered)
+            self.assertIn("hello", rendered)
+            self.assertIn("任务完成", rendered)
+
+    def test_kimicode_subagents_render_as_multiple_markdown_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session_dir = Path(tmp) / "project-hash" / "session-123"
+            _write_jsonl(
+                session_dir / "wire.jsonl",
+                [
+                    {
+                        "timestamp": 1779113209.0,
+                        "message": {
+                            "type": "TurnBegin",
+                            "payload": {"user_input": "实现 copy 算子"},
+                        },
+                    },
+                    {
+                        "timestamp": 1779113210.0,
+                        "message": {
+                            "type": "ToolCall",
+                            "payload": {
+                                "id": "tool_agent",
+                                "function": {"name": "Agent", "arguments": ""},
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": 1779113210.1,
+                        "message": {
+                            "type": "ToolCallPart",
+                            "payload": {
+                                "arguments_part": json.dumps(
+                                    {
+                                        "description": "copy Extractor",
+                                        "subagent_type": "coder",
+                                        "prompt": "分析需求",
+                                    }
+                                )
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": 1779113211.0,
+                        "message": {
+                            "type": "SubagentEvent",
+                            "payload": {
+                                "parent_tool_call_id": "tool_agent",
+                                "agent_id": "agent-1",
+                                "subagent_type": "coder",
+                                "event": {
+                                    "type": "ContentPart",
+                                    "payload": {"type": "text", "text": "子代理处理中"},
+                                },
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": 1779113212.0,
+                        "message": {
+                            "type": "ContentPart",
+                            "payload": {"type": "text", "text": "主代理完成"},
+                        },
+                    },
+                ],
+            )
+            (session_dir / "subagents" / "agent-1" / "meta.json").parent.mkdir(parents=True)
+            (session_dir / "subagents" / "agent-1" / "meta.json").write_text(
+                json.dumps({"agent_id": "agent-1", "description": "copy Extractor", "subagent_type": "coder"})
+            )
+            _write_jsonl(
+                session_dir / "subagents" / "agent-1" / "wire.jsonl",
+                [
+                    {
+                        "timestamp": 1779113211.0,
+                        "message": {
+                            "type": "TurnBegin",
+                            "payload": {"user_input": "分析需求"},
+                        },
+                    },
+                    {
+                        "timestamp": 1779113211.5,
+                        "message": {
+                            "type": "ContentPart",
+                            "payload": {"type": "text", "text": "子代理完成"},
+                        },
+                    },
+                ],
+            )
+
+            source = KimiCodeSource(scan_dir=Path(tmp))
+            session = source.load(source.discover()[0])
+            rendered = MarkdownFormat().render(session)
+
+            self.assertFalse(rendered.is_single_file)
+            self.assertIn("index.md", rendered.files)
+            self.assertTrue(any("子代理完成" in content for content in rendered.files.values()))
+            self.assertIn("tool_agent", session.subconversations)
 
     def test_resolve_codex_subagent_rollout_returns_main_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

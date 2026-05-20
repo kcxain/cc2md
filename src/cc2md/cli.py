@@ -11,6 +11,7 @@ from .models import Session
 from .sources.base import SessionMeta
 from .sources.claude_code import ClaudeCodeSource
 from .sources.codex import CodexSource
+from .sources.kimicode import KimiCodeSource
 
 
 def _print_table(sessions: list[SessionMeta]) -> None:
@@ -58,6 +59,8 @@ def _write_result(result: RenderResult, output: str | None, stem: str, fmt: Mark
     else:
         # Multi-file: write to a directory
         out_dir = Path(output) if output else Path(stem)
+        if out_dir.exists() and out_dir.is_file():
+            out_dir.unlink()
         out_dir.mkdir(parents=True, exist_ok=True)
         for rel_path, content in result.files.items():
             dest = out_dir / rel_path
@@ -67,12 +70,13 @@ def _write_result(result: RenderResult, output: str | None, stem: str, fmt: Mark
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Convert Claude Code or Codex chat sessions to Markdown",
+        description="Convert Claude Code, Codex, or Kimi Code chat sessions to Markdown",
         epilog=(
             "Examples:\n"
             "  cc2md --list\n"
             "  cc2md --latest -o chat.md\n"
             "  cc2md --agent codex --latest -o log\n"
+            "  cc2md --agent kimicode --dir ~/.kimi/sessions --latest -o kimi.md\n"
             "  cc2md --all -d ./exports/\n"
             "  cc2md /path/to/session.jsonl"
         ),
@@ -88,7 +92,7 @@ def main() -> None:
     parser.add_argument("--all", action="store_true", help="Convert all sessions")
     parser.add_argument(
         "--agent",
-        choices=("claude", "codex"),
+        choices=("claude", "codex", "kimi", "kimicode"),
         default="claude",
         help="Session source backend to read from",
     )
@@ -99,7 +103,8 @@ def main() -> None:
         help=(
             "Directory to scan instead of the default source directory. "
             "For Claude: project dir or ~/.claude/projects/. "
-            "For Codex: ~/.codex/sessions/ or any nested session directory."
+            "For Codex: ~/.codex/sessions/ or any nested session directory. "
+            "For Kimi Code: ~/.kimi/sessions/ or a session directory containing wire.jsonl."
         ),
     )
     parser.add_argument(
@@ -112,7 +117,12 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    source_cls = ClaudeCodeSource if args.agent == "claude" else CodexSource
+    source_cls = {
+        "claude": ClaudeCodeSource,
+        "codex": CodexSource,
+        "kimi": KimiCodeSource,
+        "kimicode": KimiCodeSource,
+    }[args.agent]
     source = source_cls(scan_dir=Path(args.dir) if args.dir else None, project_filter=args.project)
     fmt = MarkdownFormat(
         include_subagents=not args.no_subagents,

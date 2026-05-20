@@ -134,7 +134,7 @@ def _format_metadata_value(value: object) -> str:
     return str(value)
 
 
-def _codex_metadata_lines(metadata: dict[str, object]) -> list[str]:
+def _session_metadata_lines(metadata: dict[str, object]) -> list[str]:
     if not metadata:
         return []
 
@@ -167,7 +167,7 @@ def _codex_metadata_lines(metadata: dict[str, object]) -> list[str]:
         ("last_event_at", "Last Event At"),
     ]
 
-    lines = ["## Codex Metadata", ""]
+    lines = ["## Session Metadata", ""]
     for key, label in ordered_fields:
         if key not in metadata:
             continue
@@ -285,7 +285,7 @@ class MarkdownFormat(BaseFormat):
         if ts:
             lines.append(f"**Date:** {ts}  ")
         lines.extend(["", "---", ""])
-        lines.extend(_codex_metadata_lines(session.metadata))
+        lines.extend(_session_metadata_lines(session.metadata))
         return lines
 
     # ------------------------------------------------------------------
@@ -585,6 +585,7 @@ class MarkdownFormat(BaseFormat):
     # ------------------------------------------------------------------
 
     def _render_subconversation_messages(self, sub: SubConversation, lines: list[str]) -> None:
+        all_tool_results = self._collect_all_tool_results(sub.messages)
         index = 0
         while index < len(sub.messages):
             msg = sub.messages[index]
@@ -600,7 +601,10 @@ class MarkdownFormat(BaseFormat):
                 index += 1
                 continue
 
-            result_map, next_index = self._collect_tool_results(sub.messages, index + 1)
+            result_map: dict[str, list[ToolResultBlock]] = {}
+            for block in msg.blocks:
+                if isinstance(block, ToolUseBlock) and block.id in all_tool_results:
+                    result_map[block.id] = all_tool_results[block.id]
             rendered = self._render_assistant_message(
                 msg=msg,
                 session=Session(
@@ -615,13 +619,13 @@ class MarkdownFormat(BaseFormat):
             )
             if rendered.strip():
                 lines.append(f"{rendered}\n")
-            index = next_index
+            index += 1
 
     def _render_subconversation_inline(self, sub: SubConversation) -> str:
         """Compact rendering for single-file (inline) mode."""
         desc = sub.description or "Subagent"
         lines = [f"#### Subagent: {desc}", f"*Type: {sub.agent_type or 'unknown'}*\n"]
-        metadata_lines = _codex_metadata_lines(sub.metadata)
+        metadata_lines = _session_metadata_lines(sub.metadata)
         if metadata_lines:
             lines.extend(metadata_lines)
         self._render_subconversation_messages(sub, lines)
@@ -639,6 +643,6 @@ class MarkdownFormat(BaseFormat):
             "---",
             "",
         ]
-        lines.extend(_codex_metadata_lines(sub.metadata))
+        lines.extend(_session_metadata_lines(sub.metadata))
         self._render_subconversation_messages(sub, lines)
         return "\n".join(lines)
